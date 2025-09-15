@@ -129,7 +129,7 @@ pub fn masked_scatter_dim0(original: &Tensor, replace: &Tensor, mask: &Tensor) -
     // 按行替换
     if original.dim(0)? != 1 || mask.dim(0)? != 1 {
         return Err(Error::Msg(format!(
-            "masked_scatter_dim0 original bs: {} or mask bs :{} not equal 1 ",
+            "masked_scatter_dim0 original bs: {} or mask bs :{} not equal to 1 ",
             original.dim(0)?,
             mask.dim(0)? != 1
         )));

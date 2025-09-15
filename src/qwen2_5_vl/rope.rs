@@ -1,4 +1,6 @@
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use std::{thread, time};
+
+use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_transformers::models::deepseek2::SplitOp;
 
 pub fn compute_default_rope_parameters(dim: usize, base: f32) -> Vec<f32> {
@@ -32,21 +34,26 @@ pub fn apply_multimodel_rotary_pos_emb(
         .enumerate()
         .map(|(i, m)| m.i(i % 3).unwrap())
         .collect();
-    let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?.contiguous()?;
-
+    let cos = Tensor::cat(&cos_select, D::Minus1)?
+        .unsqueeze(1)?
+        .contiguous()?;
     let sin_select: Vec<Tensor> = sin
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
         .map(|(i, m)| m.i(i % 3).unwrap())
         .collect();
-    let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?.contiguous()?;
+    let sin = Tensor::cat(&sin_select, D::Minus1)?
+        .unsqueeze(1)?
+        .contiguous()?;
     let q_embed = q
         .broadcast_mul(&cos)?
         .add(&rotate_half(&q)?.broadcast_mul(&sin)?)?;
     let k_embed = k
         .broadcast_mul(&cos)?
         .add(&rotate_half(&k)?.broadcast_mul(&sin)?)?;
+    // let ten_second = time::Duration::from_secs(20);
+    // thread::sleep(ten_second);
     Ok((q_embed, k_embed))
 }
 
@@ -80,26 +87,28 @@ impl Qwen2_5VLTextRotaryEmbedding {
         Self { inv_freq }
     }
     pub fn forward(&self, position_ids: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
-        // position_ids shape: (3, bs, seq_len) -> (3, bs, seq_len, 1)
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus1)?
-            .to_dtype(dtype)?;
-        // inv_freq Vec<f32> -> Tensor(1, 1, 1, head_dim / 2) -> (3, bs, 1, head_dim / 2)
+        // position_ids shape: (3, bs, position) -> (3, bs, 1, position)
+        let position_ids_expanded = position_ids.unsqueeze(D::Minus2)?.to_dtype(DType::F32)?.contiguous()?;
+        // inv_freq Vec<f32> -> Tensor(1, 1, head_dim / 2, 1) -> (3, bs, head_dim / 2, 1)
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
-            (1, 1, 1, self.inv_freq.len()),
+            (1, 1, self.inv_freq.len(), 1),
             position_ids.device(),
         )?
-        .broadcast_as((3, position_ids.dim(1)?, 1, self.inv_freq.len()))?
-        .to_dtype(dtype)?;
+        .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
+        .to_dtype(DType::F32)?.contiguous()?;
 
-        // (3, bs, seq_len, 1) matmul (3, bs, 1, head_dim / 2) -> (3, bs, seq_len, head_dim / 2)
-        let freqs = position_ids_expanded.matmul(&inv_freq_expanded)?;
+        // (3, bs, head_dim / 2, 1) matmul (3, bs, 1, position) 
+        //    -> (3, bs, head_dim / 2, seq_len) -> (3, bs, seq_len, head_dim / 2)
+        let freqs = inv_freq_expanded
+            .matmul(&position_ids_expanded)?
+            .transpose(2, 3)?;
+        // let freqs = position_ids_expanded.matmul(&inv_freq_expanded)?;
         // (3, bs, seq_len, head_dim / 2) -> (3, bs, seq_len, head_dim)
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
         let cos = emb.cos()?;
         let sin = emb.sin()?;
-        Ok((cos, sin))
+        Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
 }
 

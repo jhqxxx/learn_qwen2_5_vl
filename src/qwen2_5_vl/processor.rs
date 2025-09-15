@@ -1,16 +1,13 @@
 use std::collections::HashMap;
 
-use candle_core::{D, DType, Device, Error, IndexOp, Result, Shape, Tensor, op::Op};
-use ffmpeg_next as ffmpeg;
-use image::{DynamicImage, ImageReader};
+use candle_core::{D, DType, Device, Error, IndexOp, Result, Shape, Tensor};
+use image::DynamicImage;
 use minijinja::{Environment, Value as MiniJinjaValue, context};
 use tokenizers::Tokenizer;
 
 use crate::{
     config::VisionSetting,
-    qwen2_5_vl::utils::{
-        get_image, get_video_data, load_image_from_base64, load_image_from_url, smart_resize,
-    },
+    qwen2_5_vl::utils::{get_image, get_video_data, smart_resize},
 };
 
 #[derive(Clone)]
@@ -22,7 +19,7 @@ pub struct VisionInput {
 #[derive(Clone)]
 pub struct GeneralInput {
     pub input_ids: Tensor,
-    pub attention_mask: Tensor,
+    pub mask: Tensor,
     pub cache_position: Tensor,
     pub pixel_values: Option<Tensor>,
     pub image_grid_thw: Option<Tensor>,
@@ -315,12 +312,10 @@ impl<'a> Qwen2_5VLProcessor<'a> {
 
     pub fn process_info(&self, messages: &str) -> Result<GeneralInput> {
         let mut text = self.apply_chat_template(messages)?;
-        // let mut image_inputs = None;
         let mut pixel_values = None;
         let mut image_grid_thw = None;
         let mut pixel_values_video = None;
         let mut video_grid_thw = None;
-        // let mut video_inputs = None;
         let mut second_per_grid_ts = None;
         let vision_map = self.extract_vision_info(messages)?;
         let img_mean =
@@ -333,39 +328,52 @@ impl<'a> Qwen2_5VLProcessor<'a> {
             if key.eq("image") {
                 let mut file_vec = Vec::new();
                 for file in &vec {
-                    if let Ok(img) = get_image(file) {
-                        file_vec.push(img);
-                    }
+                    let image = get_image(file);
+                    match image {
+                        Ok(img) => file_vec.push(img),
+                        Err(e) => println!("get_image err: {:?}", e),
+                    };
                 }
                 if file_vec.len() > 0 {
-                    if let Ok(img_inputs) = self.process_images(file_vec, &img_mean, &img_std) {
-                        pixel_values = Some(img_inputs.data);
-                        image_grid_thw = Some(img_inputs.grid_thw);
-                    }
+                    let vision_input = self.process_images(file_vec, &img_mean, &img_std);
+                    match vision_input {
+                        Ok(img_input) => {
+                            pixel_values = Some(img_input.data);
+                            image_grid_thw = Some(img_input.grid_thw);
+                        }
+                        Err(e) => println!("img process_images err: {:?}", e),
+                    };
                 }
             }
             if key.eq("video") {
                 let mut file_vec = Vec::new();
                 for file in &vec {
-                    if let Ok(tensor) = get_video_data(file, &self.vision_setting, &self.device) {
-                        file_vec.push(tensor);
-                    }
+                    let video_data = get_video_data(file, &self.vision_setting, &self.device);
+                    match video_data {
+                        Ok(tensor) => file_vec.push(tensor),
+                        Err(e) => println!("get_video_data err: {:?}", e),
+                    };
                 }
                 if file_vec.len() > 0 {
-                    if let Ok(video_data) = self.process_videos(file_vec, &img_mean, &img_std) {
-                        let video_num = video_data.grid_thw.dim(0)?;
-                        pixel_values_video = Some(video_data.data);
-                        video_grid_thw = Some(video_data.grid_thw);
-                        let second_per_grid = vec![
-                            self.vision_setting.temporal_patch_size as f32
-                                / self.vision_setting.fps;
-                            video_num
-                        ];
-                        second_per_grid_ts = Some(second_per_grid);
-                    }
+                    let vision_input = self.process_videos(file_vec, &img_mean, &img_std);
+                    match vision_input {
+                        Ok(video_input) => {
+                            let video_num = video_input.grid_thw.dim(0)?;
+                            pixel_values_video = Some(video_input.data);
+                            video_grid_thw = Some(video_input.grid_thw);
+                            let second_per_grid = vec![
+                                self.vision_setting.temporal_patch_size
+                                    as f32
+                                    / self.vision_setting.fps;
+                                video_num
+                            ];
+                            second_per_grid_ts = Some(second_per_grid);
+                        }
+                        Err(e) => println!("video process_videos err: {:?}", e),
+                    };
                 }
             }
-        }      
+        }
         let merge_length = self.vision_setting.merge_size.pow(2);
         if image_grid_thw.is_some() {
             let mut index = 0;
@@ -385,15 +393,14 @@ impl<'a> Qwen2_5VLProcessor<'a> {
                 let grid_i = video_grid_thw.as_ref().unwrap().i(index)?;
                 let repeat_num =
                     grid_i.to_vec1::<u32>()?.iter().product::<u32>() as usize / merge_length;
-                let replace = "<|placeholder|>"
-                    .repeat(repeat_num);
+                let replace = "<|placeholder|>".repeat(repeat_num);
                 text = text.replacen(&self.video_token, &replace, 1);
                 index += 1;
             }
             text = text.replace("<|placeholder|>", &self.video_token);
         }
         let input_ids = self.text_encode(text)?;
-        let attention_mask = Tensor::ones_like(&input_ids)?;
+        let mask = Tensor::ones_like(&input_ids)?;
         let cache_position = Tensor::ones_like(&input_ids.i(0)?)?
             .to_dtype(candle_core::DType::F64)?
             .cumsum(D::Minus1)?
@@ -401,7 +408,7 @@ impl<'a> Qwen2_5VLProcessor<'a> {
             .broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
         let input = GeneralInput {
             input_ids,
-            attention_mask,
+            mask,
             cache_position,
             pixel_values,
             image_grid_thw,

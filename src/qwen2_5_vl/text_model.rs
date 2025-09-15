@@ -7,6 +7,7 @@ use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Activation, Linear, Module, RmsNorm, VarBuilder, linear, linear_no_bias, rms_norm,
 };
+use num::integer::Roots;
 pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         Ok(xs)
@@ -34,6 +35,7 @@ impl Qwen2_5VLTextMLP {
         let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
         let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
+        
         Ok(Self {
             gate_proj,
             up_proj,
@@ -78,7 +80,8 @@ impl Qwen2_5VLTextAttention {
         let q_proj = linear(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
         let k_proj = linear(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let v_proj = linear(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+        let o_proj = linear_no_bias(hidden_size, hidden_size, vb.pp("o_proj"))?;
+        
         let scale = Tensor::new(vec![1f32 / (head_dim as f32).sqrt()], vb.device())?
             .to_dtype(vb.dtype())?;
         Ok(Self {
@@ -137,27 +140,28 @@ impl Qwen2_5VLTextAttention {
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
-
+        let query_states = query_states.contiguous()?;
         let attn_output = {
             let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
-            let attn_weights = attn_weights.broadcast_mul(&self.scale)?;
-            // let attn_weights = match attention_mask {
-            //     None => attn_weights,
-            //     Some(mask) => {
-            //         attn_weights.broadcast_add(mask)?
-            //     }
-            // };
-            // let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_weights = attn_weights.to_dtype(DType::F32)?;
-            let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?
-                .to_dtype(value_states.dtype())?;
+            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+            // let attn_weights = attn_weights.broadcast_mul(&self.scale)?;
+            let attn_weights = (attn_weights * scale)?;
+            let attn_weights = match attention_mask {
+                None => attn_weights,
+                Some(mask) => attn_weights.broadcast_add(mask)?,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            // let attn_weights = attn_weights.to_dtype(DType::F32)?;
+            // let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?
+            //     .to_dtype(value_states.dtype())?;
             let attn_weights = attn_weights.matmul(&value_states)?;
             attn_weights
         };
-
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.hidden_size))?;
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz, q_len, self.hidden_size))?;
         let attn_output = attn_output.apply(&self.o_proj)?;
         Ok(attn_output)
     }
@@ -186,7 +190,6 @@ impl Qwen2_5VLTextDecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-
         Ok(Self {
             self_attn,
             mlp,
@@ -222,9 +225,9 @@ pub struct Qwen2_5VLTextModel {
     layers: Vec<Qwen2_5VLTextDecoderLayer>,
     norm: RmsNorm,
     rotary_emb: Qwen2_5VLTextRotaryEmbedding,
+    dtype: DType,
     sliding_window: usize,
     device: Device,
-    dtype: DType,
 }
 
 impl Qwen2_5VLTextModel {
@@ -239,14 +242,15 @@ impl Qwen2_5VLTextModel {
             layers.push(layer)
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
+        let sliding_window = cfg.sliding_window;
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             rotary_emb,
-            sliding_window: cfg.sliding_window,
-            device: vb.device().clone(),
             dtype: vb.dtype(),
+            sliding_window,
+            device: vb.device().clone()
         })
     }
 
@@ -278,27 +282,14 @@ impl Qwen2_5VLTextModel {
         mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
             .to_dtype(self.dtype)
     }
-
     pub fn forward(
         &mut self,
         inputs_embeds: &Tensor,
         seqlen_offset: usize,
         position_ids: Option<&Tensor>,
-        attention_mask: &Tensor,
-        cache_position: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        let mut attention_mask = attention_mask.clone();
-        let attention_mask_: Option<&Tensor> = {
-            if seq_len <= 1 {
-                None
-            } else {
-                attention_mask = attention_mask
-                    .broadcast_sub(&Tensor::new(vec![1_u32], inputs_embeds.device())?)?
-                    .to_dtype(self.dtype)?;
-                Some(&attention_mask)
-            }
-        };
+
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
             None => Tensor::arange(
@@ -312,8 +303,15 @@ impl Qwen2_5VLTextModel {
         };
         let (cos, sin) = self.rotary_emb.forward(&position_ids, self.dtype)?;
         let mut xs = inputs_embeds.clone();
+        let attention_mask: Option<&Tensor> = {
+            if seq_len <= 1 {
+                None
+            } else {
+                Some(&self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
+            }
+        };
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, &cos, &sin, attention_mask_)?;
+            xs = layer.forward(&xs, &cos, &sin, attention_mask)?; 
         }
         let xs = xs.apply(&self.norm)?;
         Ok(xs)
@@ -325,4 +323,3 @@ impl Qwen2_5VLTextModel {
         }
     }
 }
-

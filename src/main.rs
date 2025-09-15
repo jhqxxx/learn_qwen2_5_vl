@@ -6,8 +6,11 @@ use qwen_2_5_vl::{
     qwen2_5_vl::{
         processor::{GeneralInput, Qwen2_5VLProcessor},
         qwen2_5_vl_model::Qwen2_5_VLForConditionalGeneration,
-        utils::{find_safetensors_files, get_template, nonzero_index, nonzero_slice, safe_arg_sort_last_dim},
-        vision_model::Qwen2_5_VisionTransformerPretrainedModel,
+        utils::{
+            find_safetensors_files, get_template, nonzero_index, nonzero_slice,
+            safe_arg_sort_last_dim,
+        },
+        vision_model::Qwen2_5VisionTransformerPretrainedModel,
     },
     rope::Qwen2_5VLTextRotaryEmbedding,
 };
@@ -35,7 +38,6 @@ pub fn generate_print(
         Some(token) => token,
         None => return Err(Error::Msg("can't get <|endoftext|>".to_string())),
     };
-    println!("eos_token: {:?}", eos_token);
     let eos_token2 = match processor
         .tokenizer
         .get_vocab(true)
@@ -45,7 +47,6 @@ pub fn generate_print(
         Some(token) => token,
         None => return Err(Error::Msg("can't get <|im_end|>".to_string())),
     };
-    println!("eos_token2: {:?}", eos_token2);
 
     let mut input_ids = input.input_ids.clone();
     println!("input_ids: {:?}", input_ids);
@@ -73,7 +74,7 @@ pub fn generate_print(
         None
     };
     println!("video_grid_thw: {:?}", video_grid_thw);
-    let mut attention_mask = input.attention_mask.clone();
+    let mut mask = input.mask.clone();
     let mut cache_position = input.cache_position.clone();
 
     let mut generate = Vec::new();
@@ -84,7 +85,7 @@ pub fn generate_print(
             image_grid_thw,
             pixel_values_video,
             video_grid_thw,
-            &attention_mask,
+            &mask,
             Some(&cache_position),
             seqlen_offset,
         )?;
@@ -99,8 +100,8 @@ pub fn generate_print(
         seqlen_offset += seq_len;
         seq_len = 1;
         input_ids = Tensor::from_vec(vec![next_token], (1, 1), device)?;
-        let appendd_mask = Tensor::ones((1, 1), attention_mask.dtype(), device)?;
-        attention_mask = Tensor::cat(&[attention_mask, appendd_mask], 1)?;
+        let appendd_mask = Tensor::ones((1, 1), mask.dtype(), device)?;
+        mask = Tensor::cat(&[mask, appendd_mask], 1)?;
         cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, device)?;
         pixel_values = None;
         pixel_values_video = None;
@@ -124,11 +125,11 @@ fn main() -> Result<()> {
         "messages": [
             {
                 "role": "user",
-                "content": [
+                "content": [ 
                     {
                         "type": "image",
-                        "image": "file://./assets/ocr_test.png"
-                    },
+                        "image": "file://./assets/ocr_test2.png"
+                    },                   
                     {
                         "type": "text", 
                         "text": "请分析图片并提取所有可见文本内容，按从左到右、从上到下的布局，返回纯文本"
@@ -138,18 +139,25 @@ fn main() -> Result<()> {
         ]
     }
     "#;
+    // "text": "请分析图片并提取所有可见文本内容，按从左到右、从上到下的布局，返回纯文本"
+    // {
+    //                     "type": "image",
+    //                     "image": "file://./assets/ocr_test.png"
+    //                 },
+    // let mut input = processor.process_info(message)?;
+    // println!("image_grid_thw: {}", input.image_grid_thw.unwrap());
 
     let model_list = find_safetensors_files(&model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, DType::BF16, &device)? };
     let cfg = Qwen2_5VLConfig::qwen2_5_vl_3_b_config();
     let mut vl_generate = Qwen2_5_VLForConditionalGeneration::new(cfg, vb)?;
-    let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+    let mut logits_processor = LogitsProcessor::new(5643, None, None);
     let _ = generate_print(
         &mut vl_generate,
         &mut logits_processor,
         &processor,
         message,
-        1024,
+        512,
         &device,
     )?;
 

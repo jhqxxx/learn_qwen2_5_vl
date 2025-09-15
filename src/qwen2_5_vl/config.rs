@@ -87,7 +87,6 @@ impl Qwen2_5VLVisionConfig {
         let window_size = 112;
         let out_hidden_size = 2048;
         let rms_norm_eps = 1e-6;
-        // let rope_theta = 1000000.0;
         let rope_theta = 10000.0;
         let fullatt_block_indexes = vec![7, 15, 23, 31];
 
@@ -211,6 +210,7 @@ impl Qwen2_5VLTextConfig {
         let hidden_size = 2048;
         let intermediate_size = 11008;
         let num_hidden_layers = 36;
+        // let num_hidden_layers = 1;
         let num_attention_heads = 16;
         let num_key_value_heads = 2;
         let hidden_act = Activation::Silu;

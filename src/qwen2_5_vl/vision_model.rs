@@ -1,17 +1,15 @@
 use std::{thread, time};
 
-use candle_core::{DType, Error, IndexOp, Result, Tensor, D};
+use candle_core::{D, DType, Device, Error, IndexOp, Result, Tensor};
 use candle_nn::{Activation, Init, Linear, Module, RmsNorm, VarBuilder, linear, rms_norm};
 
 use crate::{
-    config::Qwen2_5VLVisionConfig, qwen2_5_vl::utils::safe_arg_sort_last_dim, rope::{apply_rotary_pos_emb_vision, Qwen2_5VisionRotaryEmbedding}
+    config::Qwen2_5VLVisionConfig,
+    qwen2_5_vl::utils::safe_arg_sort_last_dim,
+    rope::{Qwen2_5VisionRotaryEmbedding, apply_rotary_pos_emb_vision},
 };
 
 pub struct Qwen2_5VisionPatchEmbed {
-    patch_size: usize,
-    temporal_patch_size: usize,
-    in_channels: usize,
-    embed_dim: usize,
     conv3d_weight: Tensor,
 }
 
@@ -22,42 +20,28 @@ impl Qwen2_5VisionPatchEmbed {
         let in_channels = cfg.in_channels;
         let embed_dim = cfg.hidden_size;
         // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1280, 3, 2, 14, 14; bf16, cuda:0]
-        let conv3d_weight = vb.get_with_hints(
-            (
-                embed_dim,
-                in_channels,
-                temporal_patch_size,
-                patch_size,
-                patch_size,
-            ),
-            "proj.weight",
-            Init::Const(1.),
-        )?;
-        Ok(Self {
-            patch_size,
-            temporal_patch_size,
-            in_channels,
-            embed_dim,
-            conv3d_weight,
-        })
+        // (1280, 3, 2, 14, 14) -> (1280, 1176) -> (1176, 1280)
+        let conv3d_weight = vb
+            .get_with_hints(
+                (
+                    embed_dim,
+                    in_channels,
+                    temporal_patch_size,
+                    patch_size,
+                    patch_size,
+                ),
+                "proj.weight",
+                Init::Const(1.),
+            )?
+            .flatten(1, 4)?
+            .t()?;
+        Ok(Self { conv3d_weight })
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // hidden_states shape:  (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
-        // (seq_len, hidden_size) -> ((), 3, 2, 14, 14)
-        let hidden_states = hidden_states.reshape((
-            (),
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        ))?;
-        // ((), 3, 2, 14, 14) -> ((), 1176)
-        let hidden_states = hidden_states.flatten(1, 4)?;
-        // (1280, 3, 2, 14, 14) -> (1280, 1176) -> (1176, 1280)
-        let conv3d_weight = self.conv3d_weight.flatten(1, 4)?.t()?;
         // ((), 1176) matmul (1176, 1280) -> ((), 1280)
-        let hidden_states = hidden_states.matmul(&conv3d_weight)?;
+        let hidden_states = hidden_states.matmul(&self.conv3d_weight)?;
         Ok(hidden_states)
     }
 }
@@ -128,8 +112,6 @@ struct Qwen2_5VLVisionAttention {
     qkv: Linear,
     proj: Linear,
     num_heads: usize,
-    head_dim: usize,
-    hidden_size: usize,
     scale: Tensor,
 }
 
@@ -140,14 +122,13 @@ impl Qwen2_5VLVisionAttention {
         let head_dim = hidden_size / num_heads;
         let qkv = linear(hidden_size, hidden_size * 3, vb.pp("qkv"))?;
         let proj = linear(hidden_size, hidden_size, vb.pp("proj"))?;
-        let scale = Tensor::new(vec![1f32 / (head_dim as f32).sqrt()], vb.device())?.to_dtype(vb.dtype())?;
+        let scale = Tensor::new(vec![1f32 / (head_dim as f32).sqrt()], vb.device())?
+            .to_dtype(vb.dtype())?;
         Ok(Self {
             qkv,
             proj,
             num_heads,
-            head_dim,
-            hidden_size,
-            scale
+            scale,
         })
     }
 
@@ -156,7 +137,7 @@ impl Qwen2_5VLVisionAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        cu_seqlens: &Tensor,
+        attention_mask: &Tensor,
     ) -> Result<Tensor> {
         // xs: (seq_len, hidden_size)
         let seq_length = xs.dim(0)?;
@@ -177,29 +158,22 @@ impl Qwen2_5VLVisionAttention {
         let key_states = key_states.transpose(0, 1)?.contiguous()?;
         let value_states = value_states.transpose(0, 1)?.contiguous()?;
 
-        let mut attention_mask = Tensor::new(f32::NEG_INFINITY, query_states.device())?
-            .broadcast_as((1, seq_length, seq_length))?;
-        for i in 1..cu_seqlens.dim(0)? {
-            let start = cu_seqlens.i(i - 1)?.to_scalar::<u32>()? as usize;
-            let end = cu_seqlens.i(i)?.to_scalar::<u32>()? as usize;
-            let block_size = end - start;
-            let ones = Tensor::ones(
-                (1, block_size, block_size),
-                candle_core::DType::F32,
-                query_states.device(),
-            )?;
-            attention_mask =
-                attention_mask.slice_assign(&[(0..1), (start..end), (start..end)], &ones)?;
-        }
-        let attention_mask = attention_mask.to_dtype(query_states.dtype())?.contiguous()?;
         let attn_output = {
-            let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?.broadcast_mul(&self.scale)?;
+            let attn_weights = query_states
+                .matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?
+                .broadcast_mul(&self.scale)?;
             let attn_weights = attn_weights.broadcast_add(&attention_mask)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            // let attn_weights = attn_weights.to_dtype(DType::F32)?;
+            // let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?
+            //     .to_dtype(value_states.dtype())?;
             attn_weights.matmul(&value_states)?
         };
         // (num_heads, seq_len, head_dim) -> (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
-        let attn_output = attn_output.transpose(0, 1)?.reshape((seq_length, ()))?.contiguous()?;
+        let attn_output = attn_output
+            .transpose(0, 1)?
+            .reshape((seq_length, ()))?
+            .contiguous()?;
         attn_output.apply(&self.proj)
     }
 }
@@ -232,11 +206,11 @@ impl Qwen2_5VLVisionBlock {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        cu_seqlens: &Tensor,
+        attention_mask: &Tensor,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.norm1.forward(xs)?;
-        let xs = self.attn.forward(&xs, cos, sin, cu_seqlens)?;
+        let xs = self.attn.forward(&xs, cos, sin, attention_mask)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.norm2)?.apply(&self.mlp)?;
@@ -244,13 +218,12 @@ impl Qwen2_5VLVisionBlock {
     }
 }
 
-pub struct Qwen2_5_VisionTransformerPretrainedModel {
+pub struct Qwen2_5VisionTransformerPretrainedModel {
     spatial_merge_size: usize,
     patch_size: usize,
     fullatt_block_indexes: Vec<usize>,
     window_size: usize,
     spatial_merge_unit: usize,
-    head_dim: usize,
     patch_embed: Qwen2_5VisionPatchEmbed,
     rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
     blocks: Vec<Qwen2_5VLVisionBlock>,
@@ -258,7 +231,7 @@ pub struct Qwen2_5_VisionTransformerPretrainedModel {
     dtype: DType,
 }
 
-impl Qwen2_5_VisionTransformerPretrainedModel {
+impl Qwen2_5VisionTransformerPretrainedModel {
     pub fn new(cfg: &Qwen2_5VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let spatial_merge_size = cfg.spatial_merge_size;
         let patch_size = cfg.patch_size;
@@ -282,12 +255,11 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
             fullatt_block_indexes,
             window_size,
             spatial_merge_unit,
-            head_dim,
             patch_embed,
             rotary_pos_emb,
             blocks,
             merger,
-            dtype
+            dtype,
         })
     }
 
@@ -297,6 +269,7 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
             let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
                 return Err(Error::Msg(format!("grid_thw Expected exactly 3 elements")));
             };
+            // hpos_ids shape (h, w)
             let hpos_ids = Tensor::arange(0, h, grid_thw.device())?
                 .unsqueeze(1)?
                 .expand((h as usize, w as usize))?;
@@ -307,7 +280,6 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
                 self.spatial_merge_size,
             ))?;
             let hpos_ids = hpos_ids.permute((0, 2, 1, 3))?.flatten_all()?;
-
             let wpos_ids = Tensor::arange(0, w, grid_thw.device())?
                 .unsqueeze(0)?
                 .expand((h as usize, w as usize))?;
@@ -318,11 +290,12 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
                 self.spatial_merge_size,
             ))?;
             let wpos_ids = wpos_ids.permute((0, 2, 1, 3))?.flatten_all()?;
+            // thw_pos_ids shape (h*w, 2)
             let thw_pos_ids =
                 Tensor::stack(&[&hpos_ids, &wpos_ids], D::Minus1)?.repeat((t as usize, 1))?;
             pos_ids.push(thw_pos_ids);
         }
-        let pos_ids = Tensor::cat(&pos_ids, 0)?;
+        let pos_ids = Tensor::cat(&pos_ids, 0)?.contiguous()?;
         let max_grid_size = grid_thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()?;
         let rotary_pos_emb_full = self
             .rotary_pos_emb
@@ -330,11 +303,14 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
 
         // contiguous()一定要加！！！很重要！！！！，不然index_select出来的是错的
         // 找错找了半天，都是泪啊，做维度索引操作后contiguous顺手写上总没错
-        let pos_ids_0 = pos_ids.i((.., 0))?.contiguous()?;
-        let pos_ids_1 = pos_ids.i((.., 1))?.contiguous()?;
-        let rotary_pos_emb_0 = rotary_pos_emb_full.index_select(&pos_ids_0, 0)?;
-        let rotary_pos_emb_1 = rotary_pos_emb_full.index_select(&pos_ids_1, 0)?;
-        let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_0, rotary_pos_emb_1], 1)?.contiguous()?;
+        // 第一列是h维度的索引
+        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
+        // 第二列是w维度的索引
+        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
+        let rotary_pos_emb_h = rotary_pos_emb_full.index_select(&pos_ids_h, 0)?;
+        let rotary_pos_emb_w = rotary_pos_emb_full.index_select(&pos_ids_w, 0)?;
+        // 每个patch融合h索引和w索引两个的位置编码信息
+        let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?;
         Ok(rotary_pos_emb)
     }
 
@@ -354,16 +330,15 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
             // 因为后续需要使用-100来做填充，所以需要int类型
             // candle好像不支持i32， DType里面都没有定义i32, 所以这里使用i64
             let mut index = Tensor::arange(
-                0_i64,
-                (grid_t * llm_grid_h * llm_grid_w) as i64,
+                window_index_id,
+                window_index_id + (grid_t * llm_grid_h * llm_grid_w) as i64,
                 grid_thw.device(),
             )?
             .reshape((grid_t as usize, llm_grid_h as usize, llm_grid_w as usize))?
             .contiguous()?;
             // python transformers 中实现如下
             // let pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size);
-            // 后面加上 % vit_merger_window_size，
-            // 保证llm_grid_h能整除vit_merger_window_size时不需要pad
+            // 后面加上 % vit_merger_window_size，保证llm_grid_h能整除vit_merger_window_size时不需要pad
             // 按理说能整除应该是不需要pad的，transformers中这样实现不知道是不是有什么其他原因
             let pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size)
                 % vit_merger_window_size;
@@ -418,8 +393,6 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
                 .collect();
             let indices_tensor = Tensor::from_slice(&indices, indices.len(), grid_thw.device())?;
             let index_new = index_padded.gather(&indices_tensor, 0)?;
-            let index_new =
-                index_new.broadcast_add(&Tensor::new(vec![window_index_id], grid_thw.device())?)?;
             window_index.push(index_new);
 
             let seq_len_last = cu_window_seqlens[cu_window_seqlens.len() - 1];
@@ -441,8 +414,31 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
             &cu_window_seqlens,
             cu_window_seqlens.len(),
             grid_thw.device(),
-        )?.to_dtype(candle_core::DType::U32)?;
+        )?
+        .to_dtype(candle_core::DType::U32)?;
         Ok((window_index_tensor, cu_window_seqlens_tensor))
+    }
+
+    pub fn get_attention_mask(
+        &self,
+        cu_seqlens: &Tensor,
+        seq_len: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let mut attention_mask =
+            Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as((1, seq_len, seq_len))?;
+        for i in 1..cu_seqlens.dim(0)? {
+            let start = cu_seqlens.i(i - 1)?.to_scalar::<u32>()? as usize;
+            let end = cu_seqlens.i(i)?.to_scalar::<u32>()? as usize;
+            let block_size = end - start;
+            let zeros =
+                Tensor::zeros((1, block_size, block_size), candle_core::DType::F32, device)?;
+            attention_mask =
+                attention_mask.slice_assign(&[(0..1), (start..end), (start..end)], &zeros)?;
+        }
+        let attention_mask = attention_mask.to_dtype(dtype)?.contiguous()?;
+        Ok(attention_mask)
     }
 
     pub fn forward(&self, hidden_states: &Tensor, grid_thw: &Tensor) -> Result<Tensor> {
@@ -477,18 +473,33 @@ impl Qwen2_5_VisionTransformerPretrainedModel {
         let cu_seqlens_repeat: Vec<Tensor> = (0..cu_seqlens.dim(0)?)
             .map(|i| cu_seqlens.i(i)?.repeat(grid_t[i] as usize))
             .collect::<Result<Vec<_>>>()?;
-        let cu_seqlens = Tensor::cat(&cu_seqlens_repeat, 0)?;
+        let cu_seqlens = Tensor::cat(&cu_seqlens_repeat, 0)?
+            .to_dtype(DType::F64)?
+            .cumsum(0)?
+            .to_dtype(DType::U32)?;
         let pad_zero = Tensor::from_vec(vec![0_u32], cu_seqlens.dim(0)?, hidden_states.device())?;
         let cu_seqlens = Tensor::cat(&[&pad_zero, &cu_seqlens], D::Minus1)?;
-        let mut cu_seqlens_now = cu_seqlens.clone();
+        
+        let attention_mask_window = self.get_attention_mask(
+            &cu_window_seqlens,
+            seq_len,
+            hidden_states.device(),
+            hidden_states.dtype(),
+        )?;
+        let attention_mask_full = self.get_attention_mask(
+            &cu_seqlens,
+            seq_len,
+            hidden_states.device(),
+            hidden_states.dtype(),
+        )?;
+        let mut attention_mask = attention_mask_window.clone();
         for (layer_num, block) in self.blocks.iter().enumerate() {
-            
             if self.fullatt_block_indexes.contains(&layer_num) {
-                cu_seqlens_now = cu_seqlens.clone();
+                attention_mask = attention_mask_full.clone();
             } else {
-                cu_seqlens_now = cu_window_seqlens.clone();
+                attention_mask = attention_mask_window.clone();
             }
-            hidden_states = block.forward(&hidden_states, &cos, &sin, &cu_seqlens_now)?;
+            hidden_states = block.forward(&hidden_states, &cos, &sin, &attention_mask)?;
         }
         let hidden_states = self.merger.forward(&hidden_states)?;
         let reverse_indices = safe_arg_sort_last_dim(&window_index, true)?;
