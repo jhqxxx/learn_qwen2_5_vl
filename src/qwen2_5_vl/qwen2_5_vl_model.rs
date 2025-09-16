@@ -353,10 +353,8 @@ impl Qwen2_5_VLForConditionalGeneration {
             Some(&position_ids)
         )?;
         let seq_len = outputs.dim(1)?;
-        // let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
-        let hidden_state = outputs;
+        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;
-        let logits = logits.narrow(1, seq_len - 1, 1)?;
         Ok(logits)
     }
     pub fn clear_kv_cache(&mut self) {

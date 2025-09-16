@@ -134,7 +134,7 @@ fn main() -> Result<()> {
                 "content": [ 
                     {
                         "type": "image",
-                        "image": "file://./assets/ocr_test1.png"
+                        "image": "file://./assets/ocr_test.png"
                     },               
                     {
                         "type": "text", 
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
         ]
     }
     "#;
-    
+
     let model_list = find_safetensors_files(&model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, DType::BF16, &device)? };
     let cfg = Qwen2_5VLConfig::qwen2_5_vl_3_b_config();

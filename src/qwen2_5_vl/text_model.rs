@@ -1,13 +1,9 @@
-use std::{thread, time};
-
-use crate::config::Qwen2_5VLConfig;
 use crate::rope::{Qwen2_5VLTextRotaryEmbedding, apply_multimodel_rotary_pos_emb};
 use crate::{config::RopeScaling, qwen2_5_vl::config::Qwen2_5VLTextConfig};
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Activation, Linear, Module, RmsNorm, VarBuilder, linear, linear_no_bias, rms_norm,
 };
-use num::integer::Roots;
 pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         Ok(xs)
@@ -80,9 +76,6 @@ impl Qwen2_5VLTextAttention {
         let k_proj = linear(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
         let v_proj = linear(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(hidden_size, hidden_size, vb.pp("o_proj"))?;
-        
-        let scale = Tensor::new(vec![1f32 / (head_dim as f32).sqrt()], vb.device())?
-            .to_dtype(vb.dtype())?;
         Ok(Self {
             q_proj,
             k_proj,
