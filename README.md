@@ -8,6 +8,12 @@
 
 欢迎有兴趣的同学共同改进此项目＼(^o^)／
 
+#### 配套讲解视频
+B站：[Qwen2.5VL推理的rust实现](https://www.bilibili.com/video/BV1EopyzaE2G/?share_source=copy_web&vd_source=9bbb759c3e7edda5d4577509b961f6f1)
+
+#### 学习笔记地址
+[Qwen2.5VL推理的rust实现](https://jhqxxx.github.io/learn_qwen2_5_vl.html)
+
 
 #### 环境依赖
 * ffmpeg安装参考: https://github.com/zmwangx/rust-ffmpeg/wiki/Notes-on-building
