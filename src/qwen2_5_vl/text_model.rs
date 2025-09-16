@@ -66,7 +66,6 @@ struct Qwen2_5VLTextAttention {
     hidden_size: usize,
     kv_cache: Option<(Tensor, Tensor)>,
     rope_scaling: RopeScaling,
-    scale: Tensor,
 }
 
 impl Qwen2_5VLTextAttention {
@@ -96,7 +95,6 @@ impl Qwen2_5VLTextAttention {
             hidden_size,
             kv_cache: None,
             rope_scaling,
-            scale,
         })
     }
 
@@ -144,16 +142,12 @@ impl Qwen2_5VLTextAttention {
         let attn_output = {
             let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            // let attn_weights = attn_weights.broadcast_mul(&self.scale)?;
             let attn_weights = (attn_weights * scale)?;
             let attn_weights = match attention_mask {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            // let attn_weights = attn_weights.to_dtype(DType::F32)?;
-            // let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?
-            //     .to_dtype(value_states.dtype())?;
             let attn_weights = attn_weights.matmul(&value_states)?;
             attn_weights
         };

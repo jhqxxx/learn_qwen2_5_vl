@@ -164,9 +164,6 @@ impl Qwen2_5VLVisionAttention {
                 .broadcast_mul(&self.scale)?;
             let attn_weights = attn_weights.broadcast_add(&attention_mask)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            // let attn_weights = attn_weights.to_dtype(DType::F32)?;
-            // let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?
-            //     .to_dtype(value_states.dtype())?;
             attn_weights.matmul(&value_states)?
         };
         // (num_heads, seq_len, head_dim) -> (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
@@ -470,16 +467,26 @@ impl Qwen2_5VisionTransformerPretrainedModel {
         let sin = emb.sin()?.to_dtype(hidden_states.dtype())?;
         let cu_seqlens = grid_thw.i((.., 1))?.mul(&grid_thw.i((.., 2))?)?;
         let grid_t = grid_thw.i((.., 0))?.to_vec1::<u32>()?;
-        let cu_seqlens_repeat: Vec<Tensor> = (0..cu_seqlens.dim(0)?)
-            .map(|i| cu_seqlens.i(i)?.repeat(grid_t[i] as usize))
-            .collect::<Result<Vec<_>>>()?;
-        let cu_seqlens = Tensor::cat(&cu_seqlens_repeat, 0)?
-            .to_dtype(DType::F64)?
+        let cu_seqlens_full = match cu_seqlens.rank() {
+            1 => {
+                cu_seqlens.repeat(grid_t[0] as usize)?
+            },
+            2 => {
+                let mut cu_seqlens_repeat = Vec::new();
+                for (index, t) in grid_t.iter().enumerate() {
+                    cu_seqlens_repeat.push(cu_seqlens.i(index)?.repeat(t.clone() as usize)?);
+                }
+                Tensor::cat(&cu_seqlens_repeat, 0)?.flatten_all()?
+            },
+            _ => {
+                return Err(Error::Msg(format!("create cu_seqlens error")));
+            }
+        };   
+        let cu_seqlens = cu_seqlens_full.to_dtype(DType::F64)?
             .cumsum(0)?
             .to_dtype(DType::U32)?;
-        let pad_zero = Tensor::from_vec(vec![0_u32], cu_seqlens.dim(0)?, hidden_states.device())?;
+        let pad_zero = Tensor::from_vec(vec![0_u32], 1, hidden_states.device())?;
         let cu_seqlens = Tensor::cat(&[&pad_zero, &cu_seqlens], D::Minus1)?;
-        
         let attention_mask_window = self.get_attention_mask(
             &cu_window_seqlens,
             seq_len,

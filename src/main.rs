@@ -76,6 +76,11 @@ pub fn generate_print(
     println!("video_grid_thw: {:?}", video_grid_thw);
     let mut mask = input.mask.clone();
     let mut cache_position = input.cache_position.clone();
+    let second_per_grid_ts = if input.second_per_grid_ts.is_some() {
+        Some(input.second_per_grid_ts.unwrap().clone())
+    } else {
+        None
+    };
 
     let mut generate = Vec::new();
     for _ in 0..sample_len {
@@ -88,6 +93,7 @@ pub fn generate_print(
             &mask,
             Some(&cache_position),
             seqlen_offset,
+            second_per_grid_ts.clone(),
         )?;
         let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -128,8 +134,8 @@ fn main() -> Result<()> {
                 "content": [ 
                     {
                         "type": "image",
-                        "image": "file://./assets/ocr_test2.png"
-                    },                   
+                        "image": "file://./assets/ocr_test1.png"
+                    },               
                     {
                         "type": "text", 
                         "text": "请分析图片并提取所有可见文本内容，按从左到右、从上到下的布局，返回纯文本"
@@ -139,14 +145,7 @@ fn main() -> Result<()> {
         ]
     }
     "#;
-    // "text": "请分析图片并提取所有可见文本内容，按从左到右、从上到下的布局，返回纯文本"
-    // {
-    //                     "type": "image",
-    //                     "image": "file://./assets/ocr_test.png"
-    //                 },
-    // let mut input = processor.process_info(message)?;
-    // println!("image_grid_thw: {}", input.image_grid_thw.unwrap());
-
+    
     let model_list = find_safetensors_files(&model_path)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, DType::BF16, &device)? };
     let cfg = Qwen2_5VLConfig::qwen2_5_vl_3_b_config();

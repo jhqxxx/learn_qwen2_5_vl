@@ -1,16 +1,15 @@
 use crate::{
     config::Qwen2_5VLConfig,
     qwen2_5_vl::{
-        processor::GeneralInput,
         text_model::Qwen2_5VLTextModel,
         utils::{
             get_equal_mask, get_vision_next_indices, masked_scatter_dim0, nonzero_index,
-            nonzero_slice, zero_index,
+            zero_index,
         },
         vision_model::Qwen2_5VisionTransformerPretrainedModel,
     },
 };
-use candle_core::{D, Error, IndexOp, Result, Tensor};
+use candle_core::{Error, IndexOp, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder, linear_no_bias};
 
 pub struct Qwen2_5_VLForConditionalGeneration {
@@ -48,6 +47,7 @@ impl Qwen2_5_VLForConditionalGeneration {
         image_grid_thw: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
         mask: Option<&Tensor>,
+        second_per_grid_ts: Option<Vec<f32>>
     ) -> Result<(Tensor, Tensor)> {
         let spatial_merge_size = self.cfg.vision_config.spatial_merge_size;
         let mut mrope_position_deltas: Vec<i64> = Vec::new();
@@ -77,7 +77,7 @@ impl Qwen2_5_VLForConditionalGeneration {
                 let mut text_start = 0;
                 let mut text_end = 0;
                 let mut thw = vec![];
-                let mut second_per_grid_t = 0u32;
+                let mut second_per_grid_t = 0_f32;
                 let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
                 // vision start的下一个索引
                 let vision_indices =
@@ -91,13 +91,18 @@ impl Qwen2_5_VLForConditionalGeneration {
                                 thw = image_grid_thw.unwrap().i(image_index)?.to_vec1::<u32>()?;
                                 image_index += 1;
                                 text_end = vision_indices_vec[j];
-                                second_per_grid_t = 0;
+                                second_per_grid_t = 0.0;
                             }
                             if token == self.cfg.video_token_id as u32 {
                                 thw = video_grid_thw.unwrap().i(video_index)?.to_vec1::<u32>()?;
-                                video_index += 1;
                                 text_end = vision_indices_vec[j];
-                                second_per_grid_t = 1;
+                                second_per_grid_t = match second_per_grid_ts {
+                                    None => 1.0,
+                                    Some(ref vec) => {
+                                        vec[video_index]
+                                    }
+                                };
+                                video_index += 1;
                             }
                             let llm_grid_t = thw[0];
                             let llm_grid_h = thw[1] / spatial_merge_size as u32;
@@ -125,7 +130,7 @@ impl Qwen2_5_VLForConditionalGeneration {
                             let expanded_range = range_tensor
                                 .broadcast_as((llm_grid_t as usize, (llm_grid_h * llm_grid_w) as usize))?;
                             let time_tensor = expanded_range.broadcast_mul(&Tensor::new(
-                                vec![second_per_grid_t * self.cfg.vision_config.tokens_per_second as u32],
+                                vec![(second_per_grid_t * self.cfg.vision_config.tokens_per_second as f32) as u32],
                                 input_ids_i.device(),
                             )?)?.broadcast_add(&Tensor::new(
                                 vec![start_idx + text_len],
@@ -270,6 +275,7 @@ impl Qwen2_5_VLForConditionalGeneration {
         mask: &Tensor,
         cache_position: Option<&Tensor>,
         seqlen_offset: usize,
+        second_per_grid_ts: Option<Vec<f32>>
     ) -> Result<Tensor> {
         // input_ids shape: (bs, seq_len)
         let mut inputs_embeds = self.model.embed_tokens.forward(&input_ids)?;
@@ -317,6 +323,7 @@ impl Qwen2_5_VLForConditionalGeneration {
                 image_grid_thw,
                 video_grid_thw,
                 Some(mask),
+                second_per_grid_ts,
             )?;
             self.rope_deltas = Some(rope_deltas);
         } else {

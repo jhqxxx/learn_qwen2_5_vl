@@ -9,4 +9,7 @@
 欢迎有兴趣的同学共同改进此项目＼(^o^)／
 
 
+#### 环境依赖
+* ffmpeg安装参考: https://github.com/zmwangx/rust-ffmpeg/wiki/Notes-on-building
+    * ubuntu/WSL: sudo apt install -y clang libavcodec-dev libavformat-dev libavutil-dev pkg-config libavfilter-dev libavdevice-dev
 
