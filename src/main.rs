@@ -14,7 +14,7 @@ use qwen_2_5_vl::{
     },
     rope::Qwen2_5VLTextRotaryEmbedding,
 };
-use std::{collections::HashSet, fs, thread, time, vec};
+use std::{collections::HashSet, fs, thread, time::{self, Instant}, vec};
 use tokenizers::Tokenizer;
 
 pub fn generate_print(
@@ -122,7 +122,7 @@ pub fn generate_print(
 fn main() -> Result<()> {
     let device = Device::cuda_if_available(0)?;
 
-    let model_path = "/mnt/c/jhq/huggingface_model/Qwen/Qwen2___5-VL-3B-Instruct";
+    let model_path = "/home/jhq/huggingface_model/Qwen/Qwen2.5-VL-3B-Instruct";
     let template = get_template(model_path.to_string())?;
     let processor = Qwen2_5VLProcessor::new(model_path, &template, &device, DType::BF16)?;
 
@@ -151,6 +151,7 @@ fn main() -> Result<()> {
     let cfg = Qwen2_5VLConfig::qwen2_5_vl_3_b_config();
     let mut vl_generate = Qwen2_5_VLForConditionalGeneration::new(cfg, vb)?;
     let mut logits_processor = LogitsProcessor::new(5643, None, None);
+    let start = Instant::now();
     let _ = generate_print(
         &mut vl_generate,
         &mut logits_processor,
@@ -159,6 +160,9 @@ fn main() -> Result<()> {
         512,
         &device,
     )?;
+    let duration = start.elapsed();
+
+    println!("Time elapsed in generate is: {:?}", duration);
 
     Ok(())
 }

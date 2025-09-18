@@ -19,3 +19,7 @@ B站：[Qwen2.5VL推理的rust实现](https://www.bilibili.com/video/BV1EopyzaE2
 * ffmpeg安装参考: https://github.com/zmwangx/rust-ffmpeg/wiki/Notes-on-building
     * ubuntu/WSL: sudo apt install -y clang libavcodec-dev libavformat-dev libavutil-dev pkg-config libavfilter-dev libavdevice-dev
 
+#### 资源占用
+* flash-attn编译时内存占用56G左右，如果不够可以加虚拟内存
+* 3080上，不使用flash-attn时，ocr_test.png推理耗时：5.446785921s
+* 3080上，使用flash-attn时，ocr_test.png推理耗时：1.132931528s

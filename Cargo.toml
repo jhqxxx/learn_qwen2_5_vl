@@ -8,6 +8,7 @@ base64 = "0.22.1"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
 candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
 candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"]  }
+candle-flash-attn = { git = "https://github.com/huggingface/candle.git" }
 ffmpeg-next = "8.0.0"
 image = "0.25.6"
 minijinja = "2.12.0"

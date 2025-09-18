@@ -132,18 +132,24 @@ impl Qwen2_5VLTextAttention {
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
         let query_states = query_states.contiguous()?;
-        let attn_output = {
-            let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (attn_weights * scale)?;
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_weights = attn_weights.matmul(&value_states)?;
-            attn_weights
-        };
+        let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+        // let attn_output = {
+        //     let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
+        //     let attn_weights = (attn_weights * scale)?;
+        //     let attn_weights = match attention_mask {
+        //         None => attn_weights,
+        //         Some(mask) => attn_weights.broadcast_add(mask)?,
+        //     };
+        //     let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        //     let attn_weights = attn_weights.matmul(&value_states)?;
+        //     attn_weights
+        // };
+        // use flash-attn, 
+        // flash-attn shape: (bs, seq_len, num_head, head_dim)
+        let query_states = query_states.transpose(1, 2)?;
+        let key_states = key_states.transpose(1, 2)?;
+        let value_states = value_states.transpose(1, 2)?;        
+        let attn_output = candle_flash_attn::flash_attn(&query_states, &key_states, &value_states, scale as f32, attention_mask.is_some())?.transpose(1, 2)?;
         let attn_output =
             attn_output
                 .transpose(1, 2)?
@@ -297,8 +303,10 @@ impl Qwen2_5VLTextModel {
                 Some(&self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
             }
         };
+        let mut i = 0;
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, &cos, &sin, attention_mask)?; 
+            i += 1;
         }
         let xs = xs.apply(&self.norm)?;
         Ok(xs)

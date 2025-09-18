@@ -1,4 +1,3 @@
-use candle_core::Tensor;
 use candle_nn::Activation;
 pub enum ModelType {
     Qwen2_5VLVision,
